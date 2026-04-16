@@ -200,6 +200,7 @@ class WebAuthBridge:
         self,
         count: int,
         *,
+        headless: bool | None = None,
         session_renewal: SessionRenewalCallback | None = None,
         **context_kwargs: Any,
     ) -> AsyncIterator[list[BrowserContext]]:
@@ -210,16 +211,21 @@ class WebAuthBridge:
 
         Args:
             count: Number of parallel browser contexts.
+            headless: Whether pool browsers run headless.  Defaults to the
+                bridge's own ``headless`` setting.  Pass ``True`` to force
+                headless even when the bridge was created with headed mode
+                (useful for lightweight parallel workers on non-WAF sites).
             session_renewal: Optional callback for stateful session renewal.
             **context_kwargs: Extra arguments for ``browser.new_context()``.
 
         Yields:
             A list of initialized ``BrowserContext`` instances.
         """
+        pool_headless = headless if headless is not None else self._headless
         result = self._require_auth_result()
         manager = BrowserManager(
             browser_type=self._browser_type,
-            headless=True,  # Execution browsers are always headless
+            headless=pool_headless,
             stealth=self._stealth,
             launch_kwargs=self._launch_kwargs,
         )

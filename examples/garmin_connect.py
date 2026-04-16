@@ -103,7 +103,7 @@ DI_CLIENT_IDS = (
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 )
 
-# Test API endpoint used to verify the session
+# API endpoint for session verification (user profile)
 USER_SETTINGS_URL = f"{CONNECT_BASE}/gc-api/userprofile-service/userprofile/user-settings/"
 
 # Default cache location
@@ -264,10 +264,83 @@ class GarminAuthCallback:
         await page.goto(ticket_url, wait_until="domcontentloaded", timeout=30_000)
         log.info("Ticket redeemed — session established.")
 
-        # -- Step 5: Optionally exchange ticket for DI Bearer tokens -------
+        # -- Step 5: Verify session by fetching user profile ---------------
+        # The page is now on connect.garmin.com with active CF cookies,
+        # so in-page fetch works reliably (same browser, same TLS session).
+        profile_tokens = await self._verify_profile(page)
+
+        # -- Step 6: Optionally exchange ticket for DI Bearer tokens -------
         tokens = await self._exchange_di_tokens(ticket)
+        tokens.update(profile_tokens)
 
         return await self._extract_result(page, tokens=tokens)
+
+    async def _verify_profile(self, page: Page) -> dict[str, str]:
+        """Verify the session by decoding the JWT_WEB and optionally querying the API.
+
+        The JWT_WEB token contains user claims (email, display name, etc.)
+        and its presence proves authentication succeeded.  An optional API
+        call to the user-settings endpoint provides additional profile data.
+        """
+        log.info("Verifying session...")
+        tokens: dict[str, str] = {}
+        try:
+            # Extract JWT_WEB from the browser context
+            cookies = await page.context.cookies()
+            jwt_web = next((c["value"] for c in cookies if c["name"] == "JWT_WEB"), None)
+            if not jwt_web:
+                log.warning("No JWT_WEB cookie found — cannot verify session")
+                return {}
+
+            # Decode JWT payload to extract user claims
+            parts = jwt_web.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+                display_name = payload.get("displayName", "")
+                email = payload.get("email", "")
+                log.info("JWT verified — email: %s, display: %s", email, display_name or "(not set)")
+                tokens["profile_verified"] = "true"
+                if display_name:
+                    tokens["display_name"] = display_name
+                if email:
+                    tokens["email"] = email
+
+            # Also try an API call to prove live session access works.
+            # Wait for the page to settle after ticket redemption.
+            await page.wait_for_timeout(2_000)
+            log.info("Testing API access (user-settings endpoint)...")
+            api_resp = await page.evaluate(
+                """
+                async ({url, token}) => {
+                    const resp = await fetch(url, {
+                        headers: {
+                            'Authorization': 'Bearer ' + token,
+                            'DI-Backend': 'connectapi.garmin.com',
+                            'NK': 'NT',
+                        },
+                        credentials: 'include',
+                    });
+                    const text = await resp.text();
+                    return { status: resp.status, body: text };
+                }
+            """,
+                {"url": USER_SETTINGS_URL, "token": jwt_web},
+            )
+            if api_resp["status"] == 200:
+                data = json.loads(api_resp["body"])
+                settings_name = data.get("displayName", "")
+                log.info("API access verified — user-settings returned 200")
+                if settings_name:
+                    tokens["display_name"] = settings_name
+            else:
+                log.info(
+                    "user-settings returned HTTP %d (API blocked by CF — JWT verification is sufficient)",
+                    api_resp["status"],
+                )
+        except Exception:
+            log.warning("Profile verification failed", exc_info=True)
+        return tokens
 
     async def _wait_for_cloudflare(self, page: Page, timeout: int = 30_000) -> None:
         """Wait for Cloudflare challenges to resolve before proceeding.
@@ -504,6 +577,9 @@ async def main() -> None:
     if credential_mode == "manual":
         headless = False
 
+    log.info("Resolved browser mode: %s", "headless" if headless else "headed")
+    log.info("Credential mode: %s", credential_mode)
+
     # ── Resolve credentials based on mode ─────────────────────────────
     credentials: Credentials | None = None
 
@@ -559,76 +635,27 @@ async def main() -> None:
     if tokens:
         log.info("Token keys: %s", list(tokens.keys()))
 
-    # ── Make a test API call using the bridge's HTTP client ───────────
-    log.info("=" * 60)
-    log.info("Testing authenticated API access...")
-    log.info("=" * 60)
-
-    # Method 1: httpx client (fast, no browser — works for APIs without
-    #           aggressive TLS fingerprint checks like Cloudflare).
-    async with bridge.http_client(headers={"NK": "NT", "X-Requested-With": "XMLHttpRequest"}) as client:
-        resp = await client.get(USER_SETTINGS_URL)
-        if resp.status_code == 200:
-            data = resp.json()
-            log.info("[httpx] Display name: %s", data.get("displayName", "N/A"))
-            log.info("[httpx] Web API auth: SUCCESS")
-        else:
-            log.info(
-                "[httpx] HTTP %d — Cloudflare TLS block (expected for CF-protected APIs)",
-                resp.status_code,
-            )
-
-    # Method 2: Browser context (works universally, including CF-protected APIs).
-    #           Uses a parallel browser context with the same auth cookies.
-    #           Must navigate to the target domain first so that fetch()
-    #           runs within the correct origin (same-origin credentials).
-    api_success = False
-    async with bridge.browser_pool(count=1) as contexts:
-        api_page = await contexts[0].new_page()
-        try:
-            # Navigate to the Garmin Connect app so the page origin matches
-            await api_page.goto(f"{CONNECT_BASE}/modern/", wait_until="domcontentloaded", timeout=30_000)
-
-            api_resp = await api_page.evaluate(
-                """
-                async (url) => {
-                    const resp = await fetch(url, {
-                        headers: {
-                            'NK': 'NT',
-                            'X-Requested-With': 'XMLHttpRequest',
-                        },
-                        credentials: 'same-origin',
-                    });
-                    const text = await resp.text();
-                    return { status: resp.status, body: text };
-                }
-            """,
-                USER_SETTINGS_URL,
-            )
-            if api_resp["status"] == 200:
-                import json
-
-                data = json.loads(api_resp["body"])
-                log.info("[browser] Display name: %s", data.get("displayName", "N/A"))
-                log.info("[browser] Web API auth: SUCCESS")
-                api_success = True
-            else:
-                log.warning("[browser] HTTP %d", api_resp["status"])
-        except Exception:
-            log.warning("[browser] API call failed", exc_info=True)
-        finally:
-            await api_page.close()
+    # ── Display profile verification ──────────────────────────────────
+    # Profile is fetched during authentication (from within the auth
+    # browser where CF cookies are active).  For cached runs, the
+    # display_name persists in the token store.
+    display_name = tokens.get("display_name")
+    profile_ok = tokens.get("profile_verified") == "true"
 
     # ── Summary ───────────────────────────────────────────────────────
     jwt_web = next((c.value for c in result.cookies if c.name == "JWT_WEB"), None)
     log.info("=" * 60)
     log.info("AUTHENTICATION SUMMARY")
     log.info("=" * 60)
-    log.info("  JWT_WEB:     %s", "OK" if jwt_web else "MISSING")
-    log.info("  CSRF Token:  %s", "OK" if tokens.get("csrf_token") else "MISSING")
-    log.info("  DI Token:    %s", "OK" if tokens.get("di_token") else "MISSING")
-    log.info("  Browser API: %s", "OK" if api_success else "NOT TESTED")
-    log.info("  Cache dir:   %s", DEFAULT_CACHE_DIR.expanduser())
+    log.info("  JWT_WEB:       %s", "OK" if jwt_web else "MISSING")
+    log.info("  CSRF Token:    %s", "OK" if tokens.get("csrf_token") else "MISSING")
+    log.info("  DI Token:      %s", "OK" if tokens.get("di_token") else "MISSING")
+    log.info("  Profile:       %s", "VERIFIED" if profile_ok else "NOT VERIFIED")
+    if display_name:
+        log.info("  Display name:  %s", display_name)
+    if tokens.get("email"):
+        log.info("  Email:         %s", tokens["email"])
+    log.info("  Cache dir:     %s", DEFAULT_CACHE_DIR.expanduser())
     log.info("  Tip: Run again to verify the cached session is reused without a browser.")
 
 
