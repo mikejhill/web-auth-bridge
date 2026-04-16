@@ -14,16 +14,34 @@ Authentication flow (driven by ``GarminAuthCallback``):
 Cached sessions are reused automatically on subsequent runs — if the ``JWT_WEB``
 cookie is still valid, the browser is never launched.
 
+Configuration
+~~~~~~~~~~~~~
+Copy ``.env.example`` to ``.env`` in this directory and fill in values.
+The ``.env`` file supports three credential modes:
+
+- **auto** — Credentials from ``GARMIN_EMAIL``/``GARMIN_PASSWORD`` are entered
+  automatically by the browser. Works in both headless and headed mode.
+- **manual** — The browser opens visibly and the user enters credentials by hand.
+  Forces headed mode regardless of ``GARMIN_HEADLESS``.
+- **prompt** — Credentials are requested interactively in the terminal, then
+  entered automatically by the browser.
+
+CLI flags (``--email``, ``--password``, ``--headed``, ``--credential-mode``)
+override ``.env`` values.
+
 Usage::
 
-    # First run — authenticates via browser, caches result
-    python garmin_connect.py --email you@example.com --password hunter2
+    # Auto mode (headless) — credentials from .env
+    python garmin_connect.py
 
-    # Second run — uses cached session, no browser needed
-    python garmin_connect.py --email you@example.com --password hunter2
+    # Manual mode — user logs in visually
+    python garmin_connect.py --credential-mode manual
 
-    # Headed mode for debugging
-    python garmin_connect.py --headed
+    # Prompt mode — terminal prompts, then headless
+    python garmin_connect.py --credential-mode prompt
+
+    # Override .env with CLI flags
+    python garmin_connect.py --email you@example.com --password hunter2 --headed
 """
 
 from __future__ import annotations
@@ -34,6 +52,7 @@ import base64
 import getpass
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -350,38 +369,109 @@ class GarminAuthCallback:
 
 
 # ---------------------------------------------------------------------------
+# .env loader
+# ---------------------------------------------------------------------------
+
+
+def _load_dotenv(env_path: Path | None = None) -> None:
+    """Load key=value pairs from a .env file into ``os.environ``.
+
+    Skips blank lines and comments. Does not override existing env vars.
+    """
+    path = env_path or Path(__file__).parent / ".env"
+    if not path.is_file():
+        return
+    with path.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 async def main() -> None:
     """Run the Garmin Connect authentication example."""
+    _load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="Garmin Connect authentication via web-auth-bridge",
-        epilog=(
-            "On the first run, a browser authenticates against Garmin SSO. "
-            "Subsequent runs reuse the cached session automatically."
-        ),
+        epilog=("Configuration is loaded from .env (copy .env.example). CLI flags override .env values."),
     )
-    parser.add_argument("--email", help="Garmin account email")
-    parser.add_argument("--password", help="Garmin account password")
+    parser.add_argument("--email", help="Garmin account email (overrides GARMIN_EMAIL)")
+    parser.add_argument("--password", help="Garmin account password (overrides GARMIN_PASSWORD)")
     parser.add_argument(
         "--headed",
         action="store_true",
-        help="Show the browser window (useful for debugging or manual login)",
+        default=None,
+        help="Show the browser window (overrides GARMIN_HEADLESS=false)",
+    )
+    parser.add_argument(
+        "--credential-mode",
+        choices=["auto", "manual", "prompt"],
+        default=None,
+        help="How credentials are provided (overrides GARMIN_CREDENTIAL_MODE)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Auth cache directory (overrides GARMIN_CACHE_DIR)",
     )
     args = parser.parse_args()
 
-    # Collect credentials (prompt interactively if not supplied)
-    email = args.email or input("Email: ")
-    password = args.password or getpass.getpass("Password: ")
+    # ── Resolve configuration (CLI > env > defaults) ──────────────────
+    credential_mode = args.credential_mode or os.environ.get("GARMIN_CREDENTIAL_MODE", "auto")
+    cache_dir = args.cache_dir or Path(os.environ.get("GARMIN_CACHE_DIR", "") or DEFAULT_CACHE_DIR)
+
+    # Headed/headless: CLI --headed wins, then env, then default headless
+    if args.headed is not None:
+        headless = not args.headed
+    else:
+        headless = os.environ.get("GARMIN_HEADLESS", "true").lower() in ("true", "1", "yes")
+
+    # Manual mode forces headed browser
+    if credential_mode == "manual":
+        headless = False
+
+    # ── Resolve credentials based on mode ─────────────────────────────
+    credentials: Credentials | None = None
+
+    if credential_mode == "manual":
+        log.info("Credential mode: manual — user will log in via the visible browser")
+        credentials = None
+    elif credential_mode == "prompt":
+        log.info("Credential mode: prompt — requesting credentials interactively")
+        email = input("Email: ")
+        password = getpass.getpass("Password: ")
+        credentials = Credentials(username=email, password=password)
+    else:
+        # auto mode: CLI flags > env vars > interactive fallback
+        email = args.email or os.environ.get("GARMIN_EMAIL", "")
+        password = args.password or os.environ.get("GARMIN_PASSWORD", "")
+        if email and password:
+            log.info("Credential mode: auto — using stored credentials")
+            credentials = Credentials(username=email, password=password)
+        else:
+            log.info("Credential mode: auto — no stored credentials, falling back to prompt")
+            email = email or input("Email: ")
+            password = password or getpass.getpass("Password: ")
+            credentials = Credentials(username=email, password=password)
 
     # ── Set up the bridge ─────────────────────────────────────────────
     bridge = WebAuthBridge(
         auth_callback=GarminAuthCallback(),
-        cache_dir=DEFAULT_CACHE_DIR,
-        credentials=Credentials(username=email, password=password),
-        headless=not args.headed,
+        cache_dir=cache_dir,
+        credentials=credentials,
+        headless=headless,
     )
 
     # ── Authenticate (uses cache on second run) ───────────────────────
