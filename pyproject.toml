@@ -13,6 +13,14 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+# TLS impersonation for sites that block non-browser TLS fingerprints
+# (e.g., Cloudflare-protected APIs). Used by examples/garmin_connect.py
+# to exchange CAS service tickets for DI Bearer tokens.
+tls-impersonation = [
+    "curl-cffi>=0.15",
+]
+
 [project.scripts]
 web-auth-bridge = "web_auth_bridge.__main__:main"
 

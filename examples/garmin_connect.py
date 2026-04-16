@@ -8,11 +8,20 @@ Authentication flow (driven by ``GarminAuthCallback``):
   1. Navigate to Garmin SSO sign-in page (Cloudflare challenge auto-solved by Playwright).
   2. POST credentials via an in-page ``fetch()`` call to avoid CORS/cookie issues.
   3. Handle MFA if the account requires it (prompts user interactively).
-  4. Navigate to the ticket URL to establish a web session (``JWT_WEB`` cookie).
-  5. Optionally exchange the service ticket for DI Bearer tokens (native API auth).
+  4. Exchange the service ticket for a DI OAuth2 Bearer token (native mobile API auth).
+  5. Navigate to the ticket URL to establish a web session (``JWT_WEB`` cookie).
+  6. Fetch the user profile from ``connectapi.garmin.com`` to prove API access works.
 
 Cached sessions are reused automatically on subsequent runs — if the ``JWT_WEB``
-cookie is still valid, the browser is never launched.
+cookie is still valid, the browser is never launched and all API calls are
+made via plain HTTP with the cached DI Bearer token.
+
+Install
+~~~~~~~
+This example needs the ``tls-impersonation`` extra (``curl_cffi``) to bypass
+Garmin's TLS fingerprint block on ``diauth.garmin.com``::
+
+    uv sync --extra tls-impersonation
 
 Configuration
 ~~~~~~~~~~~~~
@@ -103,8 +112,39 @@ DI_CLIENT_IDS = (
     "GARMIN_CONNECT_MOBILE_ANDROID_DI",
 )
 
-# API endpoint for session verification (user profile)
-USER_SETTINGS_URL = f"{CONNECT_BASE}/gc-api/userprofile-service/userprofile/user-settings/"
+# Native Android API User-Agent — required for connectapi.garmin.com requests
+# authenticated with DI Bearer tokens.  Garmin's API layer rejects requests
+# whose UA/headers don't match a known Garmin Connect Mobile version.
+NATIVE_API_USER_AGENT = "GCM-Android-5.23"
+NATIVE_X_GARMIN_USER_AGENT = (
+    "com.garmin.android.apps.connectmobile/5.23; ; Google/sdk_gphone64_arm64/google; Android/33; Dalvik/2.1.0"
+)
+
+
+def _native_api_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the Garmin Connect Mobile Android header set for connectapi calls."""
+    headers: dict[str, str] = {
+        "User-Agent": NATIVE_API_USER_AGENT,
+        "X-Garmin-User-Agent": NATIVE_X_GARMIN_USER_AGENT,
+        "X-Garmin-Paired-App-Version": "10861",
+        "X-Garmin-Client-Platform": "Android",
+        "X-App-Ver": "10861",
+        "X-Lang": "en",
+        "X-GCExperience": "GC5",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+# Connect API endpoints (DI Bearer token authenticated).  These live on
+# ``connectapi.garmin.com`` (the native/mobile API host), which is NOT
+# protected by the same Cloudflare TLS challenge as ``connect.garmin.com``.
+USER_SETTINGS_URL = f"{CONNECTAPI_BASE}/userprofile-service/userprofile/user-settings"
+SOCIAL_PROFILE_URL = f"{CONNECTAPI_BASE}/userprofile-service/socialProfile"
+RECENT_ACTIVITIES_URL = f"{CONNECTAPI_BASE}/activitylist-service/activities/search/activities?start=0&limit=3"
 
 # Default cache location
 DEFAULT_CACHE_DIR = Path("~/.config/garmin-connect/cache")
@@ -259,88 +299,22 @@ class GarminAuthCallback:
 
         log.info("Service ticket obtained.")
 
-        # -- Step 4: Redeem ticket for JWT_WEB cookie ----------------------
+        # -- Step 4: Exchange ticket for DI Bearer tokens FIRST ------------
+        # CAS service tickets are single-use: the ``GET /app?ticket=...``
+        # call below consumes the ticket and invalidates it.  So we must
+        # do the DI OAuth2 exchange *before* redeeming for JWT_WEB.
+        tokens = _exchange_di_tokens(ticket)
+
+        # -- Step 5: Redeem ticket for JWT_WEB cookie ----------------------
         ticket_url = f"{CONNECT_BASE}/app?ticket={ticket}"
         await page.goto(ticket_url, wait_until="domcontentloaded", timeout=30_000)
         log.info("Ticket redeemed — session established.")
 
-        # -- Step 5: Verify session by fetching user profile ---------------
-        # The page is now on connect.garmin.com with active CF cookies,
-        # so in-page fetch works reliably (same browser, same TLS session).
-        profile_tokens = await self._verify_profile(page)
-
-        # -- Step 6: Optionally exchange ticket for DI Bearer tokens -------
-        tokens = await self._exchange_di_tokens(ticket)
+        # -- Step 6: Verify session by fetching the user profile -----------
+        profile_tokens = _verify_profile(tokens.get("di_token"))
         tokens.update(profile_tokens)
 
         return await self._extract_result(page, tokens=tokens)
-
-    async def _verify_profile(self, page: Page) -> dict[str, str]:
-        """Verify the session by decoding the JWT_WEB and optionally querying the API.
-
-        The JWT_WEB token contains user claims (email, display name, etc.)
-        and its presence proves authentication succeeded.  An optional API
-        call to the user-settings endpoint provides additional profile data.
-        """
-        log.info("Verifying session...")
-        tokens: dict[str, str] = {}
-        try:
-            # Extract JWT_WEB from the browser context
-            cookies = await page.context.cookies()
-            jwt_web = next((c["value"] for c in cookies if c["name"] == "JWT_WEB"), None)
-            if not jwt_web:
-                log.warning("No JWT_WEB cookie found — cannot verify session")
-                return {}
-
-            # Decode JWT payload to extract user claims
-            parts = jwt_web.split(".")
-            if len(parts) >= 2:
-                payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
-                payload = json.loads(base64.urlsafe_b64decode(payload_b64))
-                display_name = payload.get("displayName", "")
-                email = payload.get("email", "")
-                log.info("JWT verified — email: %s, display: %s", email, display_name or "(not set)")
-                tokens["profile_verified"] = "true"
-                if display_name:
-                    tokens["display_name"] = display_name
-                if email:
-                    tokens["email"] = email
-
-            # Also try an API call to prove live session access works.
-            # Wait for the page to settle after ticket redemption.
-            await page.wait_for_timeout(2_000)
-            log.info("Testing API access (user-settings endpoint)...")
-            api_resp = await page.evaluate(
-                """
-                async ({url, token}) => {
-                    const resp = await fetch(url, {
-                        headers: {
-                            'Authorization': 'Bearer ' + token,
-                            'DI-Backend': 'connectapi.garmin.com',
-                            'NK': 'NT',
-                        },
-                        credentials: 'include',
-                    });
-                    const text = await resp.text();
-                    return { status: resp.status, body: text };
-                }
-            """,
-                {"url": USER_SETTINGS_URL, "token": jwt_web},
-            )
-            if api_resp["status"] == 200:
-                data = json.loads(api_resp["body"])
-                settings_name = data.get("displayName", "")
-                log.info("API access verified — user-settings returned 200")
-                if settings_name:
-                    tokens["display_name"] = settings_name
-            else:
-                log.info(
-                    "user-settings returned HTTP %d (API blocked by CF — JWT verification is sufficient)",
-                    api_resp["status"],
-                )
-        except Exception:
-            log.warning("Profile verification failed", exc_info=True)
-        return tokens
 
     async def _wait_for_cloudflare(self, page: Page, timeout: int = 30_000) -> None:
         """Wait for Cloudflare challenges to resolve before proceeding.
@@ -453,54 +427,204 @@ class GarminAuthCallback:
         log.info("Extracted %d cookies, %d tokens", len(cookies), len(result_tokens))
         return AuthResult(cookies=cookies, tokens=result_tokens)
 
-    async def _exchange_di_tokens(self, ticket: str) -> dict[str, str]:
-        """Exchange the service ticket for native DI Bearer tokens.
 
-        Tries multiple known client IDs until one succeeds. Returns an
-        empty dict if none work (web auth still functions without them).
-        """
+# ---------------------------------------------------------------------------
+# DI Bearer token exchange & Garmin Connect API calls
+#
+# These run outside the Playwright browser because ``diauth.garmin.com`` and
+# ``connectapi.garmin.com`` are the native mobile API hosts — designed to be
+# hit by the Garmin Connect Android app, not by a browser.  The Android app
+# uses a vanilla TLS stack, so curl_cffi's Chrome impersonation (or even
+# plain httpx for connectapi) is sufficient; no browser is required.
+# ---------------------------------------------------------------------------
+
+
+def _exchange_di_tokens(ticket: str) -> dict[str, str]:
+    """Exchange the SSO service ticket for a DI OAuth2 Bearer token.
+
+    Tries curl_cffi with Chrome TLS impersonation first — Garmin's
+    ``diauth.garmin.com`` endpoint blocks plain Python TLS fingerprints.
+    Falls back to plain httpx if curl_cffi isn't installed (likely to fail).
+
+    Returns a dict with ``di_token`` and (optionally) ``di_refresh_token``,
+    or an empty dict if all client IDs fail.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests  # type: ignore[import-not-found]
+
+        def _post(url: str, headers: dict[str, str], data: dict[str, str]) -> tuple[int, str]:
+            resp = cffi_requests.post(url, headers=headers, data=data, impersonate="chrome", timeout=30)
+            return resp.status_code, resp.text
+
+        transport = "curl_cffi(chrome)"
+    except ImportError:
         import httpx
 
-        for client_id in DI_CLIENT_IDS:
-            log.debug("Trying DI token exchange with client_id=%s", client_id)
-            headers = {
+        def _post(url: str, headers: dict[str, str], data: dict[str, str]) -> tuple[int, str]:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(url, headers=headers, data=data)
+                return resp.status_code, resp.text
+
+        transport = "httpx (curl_cffi not installed — may be blocked by TLS fingerprint)"
+
+    log.info("Exchanging service ticket for DI Bearer token (transport: %s)...", transport)
+
+    for client_id in DI_CLIENT_IDS:
+        headers = _native_api_headers(
+            {
                 "Authorization": _build_basic_auth(client_id),
+                "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
+                "Cache-Control": "no-cache",
             }
-            data = {
-                "client_id": client_id,
-                "service_ticket": ticket,
-                "grant_type": DI_GRANT_TYPE,
-                "service_url": PORTAL_SERVICE_URL,
-            }
+        )
+        data = {
+            "client_id": client_id,
+            "service_ticket": ticket,
+            "grant_type": DI_GRANT_TYPE,
+            "service_url": PORTAL_SERVICE_URL,
+        }
+        try:
+            status, body = _post(DI_TOKEN_URL, headers, data)
+        except Exception as exc:
+            log.debug("DI exchange transport error for %s: %s", client_id, exc)
+            continue
 
+        if status == 200:
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(
-                        DI_TOKEN_URL,
-                        headers=headers,
-                        data=data,
-                        timeout=30,
-                    )
-
-                if resp.status_code == 429:
-                    log.warning("DI token exchange rate limited (429)")
-                    break
-
-                if resp.is_success:
-                    token_data = resp.json()
-                    log.info("DI Bearer token obtained (client_id=%s)", client_id)
-                    tokens = {"di_token": token_data["access_token"]}
-                    if token_data.get("refresh_token"):
-                        tokens["di_refresh_token"] = token_data["refresh_token"]
-                    return tokens
-            except httpx.HTTPError as exc:
-                log.debug("DI exchange failed for %s: %s", client_id, exc)
+                token_data = json.loads(body)
+            except json.JSONDecodeError:
+                log.debug("DI exchange 200 but non-JSON for %s: %s", client_id, body[:200])
                 continue
+            log.info("DI Bearer token obtained (client_id=%s)", client_id)
+            result = {"di_token": token_data["access_token"]}
+            if token_data.get("refresh_token"):
+                result["di_refresh_token"] = token_data["refresh_token"]
+            if token_data.get("expires_in"):
+                result["di_expires_in"] = str(token_data["expires_in"])
+            return result
 
-        log.info("DI token exchange unavailable — web auth only")
+        log.debug("DI exchange failed for %s: HTTP %d — %s", client_id, status, body[:200])
+
+    log.warning("DI token exchange failed for all known client IDs — API calls will not work")
+    return {}
+
+
+def _verify_profile(di_token: str | None) -> dict[str, str]:
+    """Fetch user profile from ``connectapi.garmin.com`` to prove API access works.
+
+    Uses the DI Bearer token with native Android headers. The connectapi
+    host accepts plain HTTP clients (no TLS fingerprint check), but using
+    curl_cffi when available is still preferred for consistency.
+
+    Returns a dict of discovered profile fields, suitable for inclusion
+    in the cached token store.
+    """
+    if not di_token:
+        log.info("No DI Bearer token — skipping profile fetch")
         return {}
+
+    headers = _native_api_headers({"Authorization": f"Bearer {di_token}"})
+
+    def _get(url: str) -> tuple[int, str]:
+        try:
+            from curl_cffi import requests as cffi_requests  # type: ignore[import-not-found]
+
+            resp = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=15)
+            return resp.status_code, resp.text
+        except ImportError:
+            import httpx
+
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(url, headers=headers)
+                return resp.status_code, resp.text
+
+    tokens: dict[str, str] = {}
+
+    log.info("Fetching user settings from connectapi.garmin.com ...")
+    status, body = _get(USER_SETTINGS_URL)
+    if status == 200:
+        try:
+            data = json.loads(body)
+            user_data = data.get("userData", {}) or {}
+            log.info("user-settings OK (user_id=%s)", data.get("id") or user_data.get("userName") or "?")
+            tokens["profile_verified"] = "true"
+            if user_data.get("userName"):
+                tokens["username"] = user_data["userName"]
+        except (json.JSONDecodeError, KeyError):
+            log.warning("user-settings 200 but payload unexpected: %s", body[:200])
+    else:
+        log.warning("user-settings returned HTTP %d: %s", status, body[:200])
+
+    log.info("Fetching social profile from connectapi.garmin.com ...")
+    status, body = _get(SOCIAL_PROFILE_URL)
+    if status == 200:
+        try:
+            prof = json.loads(body)
+            display = prof.get("displayName") or prof.get("fullName", "")
+            full = prof.get("fullName", "")
+            log.info("socialProfile OK — displayName=%s, fullName=%s", display, full)
+            if display:
+                tokens["display_name"] = display
+            if full:
+                tokens["full_name"] = full
+            tokens["profile_verified"] = "true"
+        except json.JSONDecodeError:
+            log.warning("socialProfile 200 but non-JSON: %s", body[:200])
+    else:
+        log.warning("socialProfile returned HTTP %d: %s", status, body[:200])
+
+    return tokens
+
+
+def _demo_api_calls(tokens: dict[str, str]) -> None:
+    """Demonstrate live API access using only the cached DI Bearer token.
+
+    This is the payoff: after the one-time browser-based authentication, all
+    further API calls are simple HTTP requests with an ``Authorization: Bearer``
+    header.  No browser, no cookies, no CF challenges.
+    """
+    di_token = tokens.get("di_token")
+    if not di_token:
+        log.warning("Skipping API demo — no DI Bearer token available")
+        return
+
+    headers = _native_api_headers({"Authorization": f"Bearer {di_token}"})
+    try:
+        from curl_cffi import requests as cffi_requests  # type: ignore[import-not-found]
+
+        def _get(url: str) -> tuple[int, str]:
+            resp = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=15)
+            return resp.status_code, resp.text
+    except ImportError:
+        import httpx
+
+        def _get(url: str) -> tuple[int, str]:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(url, headers=headers)
+                return resp.status_code, resp.text
+
+    log.info("-" * 60)
+    log.info("LIVE API DEMO — Recent activities")
+    log.info("-" * 60)
+    status, body = _get(RECENT_ACTIVITIES_URL)
+    if status != 200:
+        log.warning("Recent activities returned HTTP %d: %s", status, body[:300])
+        return
+    try:
+        activities = json.loads(body)
+    except json.JSONDecodeError:
+        log.warning("Recent activities returned non-JSON: %s", body[:200])
+        return
+    if not isinstance(activities, list) or not activities:
+        log.info("No recent activities found.")
+        return
+    for act in activities[:3]:
+        name = act.get("activityName") or "(unnamed)"
+        start = act.get("startTimeLocal", "?")
+        dist_m = act.get("distance") or 0
+        dur_s = act.get("duration") or 0
+        log.info("  • %s — %s — %.2f km — %d:%02d", start, name, dist_m / 1000.0, int(dur_s // 60), int(dur_s % 60))
 
 
 # ---------------------------------------------------------------------------
@@ -636,11 +760,18 @@ async def main() -> None:
         log.info("Token keys: %s", list(tokens.keys()))
 
     # ── Display profile verification ──────────────────────────────────
-    # Profile is fetched during authentication (from within the auth
-    # browser where CF cookies are active).  For cached runs, the
-    # display_name persists in the token store.
+    # Profile was fetched from connectapi.garmin.com during authentication
+    # using the DI Bearer token.  For cached runs the profile fields
+    # persist in the token store.
     display_name = tokens.get("display_name")
+    full_name = tokens.get("full_name")
+    username = tokens.get("username")
     profile_ok = tokens.get("profile_verified") == "true"
+
+    # ── Live API demo using only the cached Bearer token ─────────────
+    # This is the whole point: once authenticated, subsequent runs make
+    # plain HTTP calls with the Bearer token — no browser required.
+    _demo_api_calls(tokens)
 
     # ── Summary ───────────────────────────────────────────────────────
     jwt_web = next((c.value for c in result.cookies if c.name == "JWT_WEB"), None)
@@ -651,10 +782,12 @@ async def main() -> None:
     log.info("  CSRF Token:    %s", "OK" if tokens.get("csrf_token") else "MISSING")
     log.info("  DI Token:      %s", "OK" if tokens.get("di_token") else "MISSING")
     log.info("  Profile:       %s", "VERIFIED" if profile_ok else "NOT VERIFIED")
+    if full_name:
+        log.info("  Full name:     %s", full_name)
     if display_name:
         log.info("  Display name:  %s", display_name)
-    if tokens.get("email"):
-        log.info("  Email:         %s", tokens["email"])
+    if username:
+        log.info("  Username:      %s", username)
     log.info("  Cache dir:     %s", DEFAULT_CACHE_DIR.expanduser())
     log.info("  Tip: Run again to verify the cached session is reused without a browser.")
 
