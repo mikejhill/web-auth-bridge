@@ -38,6 +38,7 @@ def _make_mock_browser_manager() -> MagicMock:
     mock_browser.new_context = AsyncMock(return_value=mock_context)
     manager.launch = AsyncMock(return_value=mock_browser)
     manager.context_kwargs = MagicMock(return_value={})
+    manager.apply_stealth = AsyncMock()
     return manager
 
 

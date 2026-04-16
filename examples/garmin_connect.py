@@ -60,6 +60,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
+from datetime import UTC
+
 from web_auth_bridge import (
     AuthResult,
     CookieData,
@@ -143,8 +145,16 @@ async def _js_fetch_json(page: Page, url: str, payload: dict[str, Any]) -> dict[
     log.debug("fetch(%s) → %d: %s", url, status, body_text[:200])
 
     if status == 429:
-        msg = f"Rate limited (429). Response: {body_text[:300]}"
-        raise RuntimeError(msg)
+        # Retry once after a backoff for rate limiting
+        log.warning("Rate limited (429) — waiting 10s and retrying...")
+        await page.wait_for_timeout(10_000)
+        result = await page.evaluate(script)
+        status = result["status"]
+        body_text = result["body"]
+        log.debug("retry fetch(%s) → %d: %s", url, status, body_text[:200])
+        if status == 429:
+            msg = f"Rate limited (429) after retry. Response: {body_text[:300]}"
+            raise RuntimeError(msg)
     if status == 403:
         msg = f"Forbidden (403). Response: {body_text[:300]}"
         raise RuntimeError(msg)
@@ -183,15 +193,13 @@ class GarminAuthCallback:
         """
         # -- Step 1: Navigate to SSO sign-in page -------------------------
         log.info("Navigating to Garmin SSO sign-in page...")
-        await page.goto(SIGNIN_URL, wait_until="networkidle", timeout=30_000)
+        await page.goto(SIGNIN_URL, wait_until="domcontentloaded", timeout=30_000)
         log.info("Page loaded: %s", page.url[:80])
 
-        # Wait through Cloudflare challenge if present
-        title = await page.title()
-        if "Just a moment" in title:
-            log.info("Cloudflare challenge detected — waiting for resolution...")
-            await page.wait_for_function("document.title !== 'Just a moment...'", timeout=15_000)
-            log.info("Challenge resolved.")
+        # Wait through Cloudflare challenge if present.  CF can appear as
+        # an interstitial ("Just a moment...") or as an invisible JS
+        # challenge that sets cookies in the background.
+        await self._wait_for_cloudflare(page)
 
         if not credentials:
             # Manual mode: wait for user to complete login in the visible browser
@@ -200,6 +208,9 @@ class GarminAuthCallback:
             return await self._extract_result(page)
 
         # -- Step 2: POST credentials via in-page fetch() -----------------
+        # Brief delay to mimic human reading the page — submitting
+        # credentials < 1s after page load can trigger bot detection.
+        await page.wait_for_timeout(2_000)
         log.info("Submitting credentials...")
         login_payload = {
             "username": credentials.username,
@@ -250,7 +261,7 @@ class GarminAuthCallback:
 
         # -- Step 4: Redeem ticket for JWT_WEB cookie ----------------------
         ticket_url = f"{CONNECT_BASE}/app?ticket={ticket}"
-        await page.goto(ticket_url, wait_until="networkidle", timeout=30_000)
+        await page.goto(ticket_url, wait_until="domcontentloaded", timeout=30_000)
         log.info("Ticket redeemed — session established.")
 
         # -- Step 5: Optionally exchange ticket for DI Bearer tokens -------
@@ -258,13 +269,56 @@ class GarminAuthCallback:
 
         return await self._extract_result(page, tokens=tokens)
 
+    async def _wait_for_cloudflare(self, page: Page, timeout: int = 30_000) -> None:
+        """Wait for Cloudflare challenges to resolve before proceeding.
+
+        Cloudflare may present:
+        - A visible interstitial (page title = "Just a moment...")
+        - An invisible JS challenge that runs in the background
+
+        In both cases, the ``cf_clearance`` cookie must be set before API
+        calls will succeed.
+        """
+        title = await page.title()
+        if "Just a moment" in title:
+            log.info("Cloudflare challenge page detected — waiting for resolution...")
+            try:
+                await page.wait_for_function(
+                    "document.title !== 'Just a moment...'",
+                    timeout=timeout,
+                )
+                log.info("Cloudflare challenge resolved.")
+            except Exception:
+                log.warning("Cloudflare challenge did not resolve within %ds", timeout // 1000)
+
+        # Wait for the sign-in form to become interactive.  This covers both
+        # the visible interstitial and invisible JS challenge cases.
+        log.info("Waiting for sign-in page to be ready...")
+        try:
+            await page.wait_for_selector(
+                'input[name="username"], input[id="username"], form',
+                state="visible",
+                timeout=timeout,
+            )
+        except Exception:
+            # The selector may not match Garmin's exact DOM — fall back to
+            # a simple delay to let CF scripts complete.
+            log.debug("Sign-in form selector not found; using timed wait")
+            await page.wait_for_timeout(3_000)
+
+        # Final stabilisation delay — lets any remaining CF background
+        # scripts finish and set cookies (cf_clearance, __cf_bm, etc.)
+        await page.wait_for_timeout(1_000)
+        log.info("Page ready.")
+
     async def is_authenticated(self, auth_result: AuthResult) -> bool:
         """Check whether the cached JWT_WEB cookie is still valid.
 
-        Makes a lightweight API call to Garmin Connect. If the server
-        returns 200, the session is still good.
+        Validates the JWT token's expiry claim (``exp``) without making a
+        network request.  This avoids Cloudflare TLS-fingerprint blocks
+        that would cause httpx-based validation to fail.
         """
-        import httpx
+        import base64
 
         jwt_web = next((c.value for c in auth_result.cookies if c.name == "JWT_WEB"), None)
         if not jwt_web:
@@ -275,22 +329,30 @@ class GarminAuthCallback:
             log.debug("Cached result has expired")
             return False
 
+        # Decode JWT payload to check expiry (no signature verification needed
+        # — we just want to know if the token has expired).
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    USER_SETTINGS_URL,
-                    headers={
-                        "Cookie": f"JWT_WEB={jwt_web}",
-                        "NK": "NT",
-                    },
-                    timeout=10,
-                )
-            if resp.status_code == 200:
-                log.info("Cached session is still valid")
+            parts = jwt_web.split(".")
+            if len(parts) < 2:
+                log.debug("JWT_WEB is not a valid JWT")
+                return False
+            # JWT base64url decoding (padding may be missing)
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+            exp = payload.get("exp")
+            if exp is None:
+                log.debug("JWT_WEB has no 'exp' claim — assuming valid")
                 return True
-            log.info("Cached session expired (HTTP %d)", resp.status_code)
-        except httpx.HTTPError as exc:
-            log.warning("Session validation request failed: %s", exc)
+            from datetime import datetime
+
+            expiry = datetime.fromtimestamp(exp, tz=UTC)
+            now = datetime.now(tz=UTC)
+            if now < expiry:
+                log.info("Cached JWT_WEB valid until %s", expiry.isoformat())
+                return True
+            log.info("Cached JWT_WEB expired at %s", expiry.isoformat())
+        except Exception:
+            log.debug("Failed to decode JWT_WEB", exc_info=True)
 
         return False
 
@@ -467,11 +529,15 @@ async def main() -> None:
             credentials = Credentials(username=email, password=password)
 
     # ── Set up the bridge ─────────────────────────────────────────────
+    # Use real Chrome/Edge via ``channel`` to avoid Cloudflare TLS
+    # fingerprint detection that blocks Playwright's bundled Chromium.
+    channel = os.environ.get("GARMIN_BROWSER_CHANNEL", "chrome")
     bridge = WebAuthBridge(
         auth_callback=GarminAuthCallback(),
         cache_dir=cache_dir,
         credentials=credentials,
         headless=headless,
+        launch_kwargs={"channel": channel},
     )
 
     # ── Authenticate (uses cache on second run) ───────────────────────
@@ -498,20 +564,60 @@ async def main() -> None:
     log.info("Testing authenticated API access...")
     log.info("=" * 60)
 
-    # Async client example
+    # Method 1: httpx client (fast, no browser — works for APIs without
+    #           aggressive TLS fingerprint checks like Cloudflare).
     async with bridge.http_client(headers={"NK": "NT", "X-Requested-With": "XMLHttpRequest"}) as client:
         resp = await client.get(USER_SETTINGS_URL)
         if resp.status_code == 200:
             data = resp.json()
-            log.info("Display name: %s", data.get("displayName", "N/A"))
-            log.info("Web API auth: SUCCESS")
+            log.info("[httpx] Display name: %s", data.get("displayName", "N/A"))
+            log.info("[httpx] Web API auth: SUCCESS")
         else:
-            log.warning("Web API auth: FAILED (HTTP %d)", resp.status_code)
+            log.info(
+                "[httpx] HTTP %d — Cloudflare TLS block (expected for CF-protected APIs)",
+                resp.status_code,
+            )
 
-    # Sync client example (useful for simple scripts)
-    with bridge.http_client_sync(headers={"NK": "NT", "X-Requested-With": "XMLHttpRequest"}) as client:
-        resp = client.get(USER_SETTINGS_URL)
-        log.info("Sync client test: HTTP %d", resp.status_code)
+    # Method 2: Browser context (works universally, including CF-protected APIs).
+    #           Uses a parallel browser context with the same auth cookies.
+    #           Must navigate to the target domain first so that fetch()
+    #           runs within the correct origin (same-origin credentials).
+    api_success = False
+    async with bridge.browser_pool(count=1) as contexts:
+        api_page = await contexts[0].new_page()
+        try:
+            # Navigate to the Garmin Connect app so the page origin matches
+            await api_page.goto(f"{CONNECT_BASE}/modern/", wait_until="domcontentloaded", timeout=30_000)
+
+            api_resp = await api_page.evaluate(
+                """
+                async (url) => {
+                    const resp = await fetch(url, {
+                        headers: {
+                            'NK': 'NT',
+                            'X-Requested-With': 'XMLHttpRequest',
+                        },
+                        credentials: 'same-origin',
+                    });
+                    const text = await resp.text();
+                    return { status: resp.status, body: text };
+                }
+            """,
+                USER_SETTINGS_URL,
+            )
+            if api_resp["status"] == 200:
+                import json
+
+                data = json.loads(api_resp["body"])
+                log.info("[browser] Display name: %s", data.get("displayName", "N/A"))
+                log.info("[browser] Web API auth: SUCCESS")
+                api_success = True
+            else:
+                log.warning("[browser] HTTP %d", api_resp["status"])
+        except Exception:
+            log.warning("[browser] API call failed", exc_info=True)
+        finally:
+            await api_page.close()
 
     # ── Summary ───────────────────────────────────────────────────────
     jwt_web = next((c.value for c in result.cookies if c.name == "JWT_WEB"), None)
@@ -521,6 +627,7 @@ async def main() -> None:
     log.info("  JWT_WEB:     %s", "OK" if jwt_web else "MISSING")
     log.info("  CSRF Token:  %s", "OK" if tokens.get("csrf_token") else "MISSING")
     log.info("  DI Token:    %s", "OK" if tokens.get("di_token") else "MISSING")
+    log.info("  Browser API: %s", "OK" if api_success else "NOT TESTED")
     log.info("  Cache dir:   %s", DEFAULT_CACHE_DIR.expanduser())
     log.info("  Tip: Run again to verify the cached session is reused without a browser.")
 

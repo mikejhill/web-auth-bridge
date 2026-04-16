@@ -93,6 +93,7 @@ class Authenticator:
         """
         browser = await self._browser_manager.launch()
         context = await browser.new_context(**self._browser_manager.context_kwargs())
+        await self._browser_manager.apply_stealth(context)
         page = await context.new_page()
 
         try:

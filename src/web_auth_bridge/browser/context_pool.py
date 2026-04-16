@@ -84,6 +84,7 @@ class BrowserContextPool:
             for i in range(count):
                 ctx_kwargs = self._browser_manager.context_kwargs(**context_kwargs)
                 ctx = await browser.new_context(**ctx_kwargs)
+                await self._browser_manager.apply_stealth(ctx)
                 await ctx.add_cookies(cookie_dicts)
                 logger.debug("Context %d/%d created with %d cookies", i + 1, count, len(cookie_dicts))
 
