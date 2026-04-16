@@ -219,6 +219,35 @@ _STEALTH_JS = """
     if (navigator.connection && !navigator.connection.rtt) {
         Object.defineProperty(navigator.connection, 'rtt', { get: () => 50, configurable: true });
     }
+
+    // 9. Force screen.colorDepth / pixelDepth to 32.  Headless Chrome reports
+    //    24 (no real compositor attached), while every real desktop Chrome
+    //    reports 32.  Cloudflare's managed challenge fingerprint compares
+    //    these against the Client Hints platform value.
+    try {
+        Object.defineProperty(screen, 'colorDepth', { get: () => 32, configurable: true });
+        Object.defineProperty(screen, 'pixelDepth', { get: () => 32, configurable: true });
+    } catch (e) {}
+
+    // 10. Remove 'HeadlessChrome' from navigator.userAgent as a last line of
+    //     defense (the HTTP UA is set by BrowserContext.user_agent, but JS
+    //     may still see the default if something overrides it per-page).
+    try {
+        const ua = navigator.userAgent;
+        if (ua.includes('HeadlessChrome')) {
+            const patched = ua.replace('HeadlessChrome', 'Chrome');
+            Object.defineProperty(navigator, 'userAgent', { get: () => patched, configurable: true });
+            if (navigator.userAgentData) {
+                // Client Hints mirror — hide 'Headless' brand entries if any
+                const brands = (navigator.userAgentData.brands || []).filter(
+                    b => !/headless/i.test(b.brand)
+                );
+                Object.defineProperty(navigator.userAgentData, 'brands', {
+                    get: () => brands, configurable: true,
+                });
+            }
+        }
+    } catch (e) {}
 })();
 """
 
@@ -349,10 +378,15 @@ class BrowserManager:
             "timezone_id": self._stealth.timezone_id,
             "color_scheme": self._stealth.color_scheme,
         }
-        # Only override user-agent when using bundled Chromium.  Real browser
-        # channels (chrome, msedge) already have a legitimate UA string and
-        # overriding it risks creating a detectable mismatch.
-        if not self._channel:
+        # User-Agent handling:
+        #   - Bundled Chromium → always override to a regular Chrome UA
+        #     (the bundled build's default UA gives away Playwright).
+        #   - Real Chrome/Edge channel, headed → leave alone (Chrome sets a
+        #     legitimate UA that matches its build exactly).
+        #   - Real Chrome/Edge channel, headless → STILL override: Chrome's
+        #     headless mode stamps ``HeadlessChrome`` into the UA, which is
+        #     a giveaway that Cloudflare, Akamai, and others match on.
+        if not self._channel or self._headless:
             kwargs["user_agent"] = self._stealth.user_agent
         if self._stealth.extra_http_headers:
             kwargs["extra_http_headers"] = self._stealth.extra_http_headers
