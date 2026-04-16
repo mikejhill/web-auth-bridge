@@ -17,7 +17,7 @@ jobs:
     outputs:
       version: ${{ steps.semrel.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -52,7 +52,7 @@ jobs:
       - name: Build
         run: uv build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/
@@ -79,7 +79,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: dist
           path: dist/

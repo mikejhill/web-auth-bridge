@@ -2,39 +2,36 @@
 
 [![CI](https://github.com/mikejhill/web-auth-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mikejhill/web-auth-bridge/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/web-auth-bridge.svg)](https://pypi.org/project/web-auth-bridge/)
-[![Python](https://img.shields.io/pypi/pyversions/web-auth-bridge.svg)](https://pypi.org/project/web-auth-bridge/)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Browser-assisted authentication for HTTP APIs that fight back.**
+A Python library for authenticating against HTTP APIs whose login flows
+require a real browser — SSO, SAML, Cloudflare, or stateful web portals —
+and then reusing the resulting session for fast programmatic access.
 
-Many interesting APIs can't be reached with plain HTTP: they hide behind
-SSO, SAML, Cloudflare challenges, or stateful web portals with no JSON
-surface.  `web-auth-bridge` uses Playwright to handle the login *once*,
-extracts the resulting cookies and tokens as plain data, and hands them
-to your consumer code so every subsequent call is a fast `httpx` request.
+## Overview
 
-## What it does
+`web-auth-bridge` separates authentication from execution:
 
-- **Logs in with a real browser** (Playwright / Chromium) so WAFs,
-  JS challenges, and SAML redirects all just work.
-- **Extracts cookies and tokens** into a typed `AuthResult` — no more
-  hairy JSON digging.
-- **Caches auth on disk** at `~/.config/<app>/auth_cache.json` so every
-  run after the first is cache-warm.
-- **Issues parallel authenticated browsers** when a site has no clean
-  HTTP API (classic ASP.NET portals, etc.).
-- **Runs headless or headed**, with credentials from a file or typed by
-  the user into a visible browser.
+1. A Playwright-driven browser performs the login once.
+2. The resulting cookies and tokens are extracted into a typed
+   `AuthResult` and cached on disk.
+3. Subsequent calls use a plain `httpx` client with those cookies, or,
+   when a site requires a browser beyond login, a pool of pre-authenticated
+   headless contexts.
 
-## Install
+The library is intended for CLIs, agents, and integrations that need to
+script against sites with complex or interactive authentication.
+
+## Installation
 
 ```bash
 pip install web-auth-bridge
 playwright install chromium
 ```
 
-For sites that reject Python's default TLS fingerprint (e.g. Garmin's
-DI OAuth2 exchange):
+For sites that reject Python's default TLS fingerprint (for example,
+Garmin's OAuth2 token exchange):
 
 ```bash
 pip install "web-auth-bridge[tls-impersonation]"
@@ -53,7 +50,7 @@ class ExampleCallback:
         await page.fill('input[name="password"]', credentials.password)
         async with page.expect_navigation():
             await page.click('button[type="submit"]')
-        return AuthResult()  # cookies auto-extracted from the context
+        return AuthResult()
 
     async def is_authenticated(self, result):
         return not result.is_expired
@@ -73,53 +70,50 @@ async def main():
 asyncio.run(main())
 ```
 
-The first run opens Chromium; the second (within cookie lifetime) doesn't.
+On the first run the browser opens to log in. On subsequent runs the
+cached session is reused until it expires.
 
 ## When to use it
 
-Use `web-auth-bridge` when you need to script against a site whose auth
-flow you can't or don't want to reimplement by hand:
+- Sites guarded by Cloudflare or other WAFs that challenge non-browser clients.
+- SAML or OAuth portals without a public token endpoint.
+- Internal applications requiring MFA or interactive SSO.
+- Stateful web portals (for example, ASP.NET) with no HTTP API surface.
+- CLI tools for personal or private APIs where reimplementing the auth
+  flow would cost more than the tool itself.
 
-- **Cloudflare / other WAFs** that challenge non-browser clients.
-- **SAML/OAuth portals** where the app doesn't expose a token endpoint.
-- **Company intranets** that require MFA or interactive SSO.
-- **Scraping portals** with stateful sessions and no API.
-- **CLI tools for personal/private APIs** where reimplementing the auth
-  dance is more work than the tool is worth.
-
-Don't use it when you already have a clean API token — plain `httpx` is
-fine there.
+If a site already offers a clean API token, use `httpx` directly.
 
 ## Modes
 
-| Mode                       | Credentials from      | Browser visible? | Typical use case                                |
-| -------------------------- | --------------------- | ---------------- | ----------------------------------------------- |
-| Headless + stored creds    | `.env` / file         | No               | Fully automated CLIs and agents                 |
-| Headed + stored creds      | `.env` / file         | Yes              | Debugging; sites that require a visible window  |
-| Headed + manual entry      | User types into page  | Yes              | Sensitive credentials never written to disk     |
-| Headless + no creds        | Previously-cached     | No               | Every post-first run                            |
+| Mode                    | Credentials source   | Browser visible | Typical use case                           |
+| ----------------------- | -------------------- | --------------- | ------------------------------------------ |
+| Headless + stored creds | `.env` / config file | No              | Fully automated CLIs and agents            |
+| Headed + stored creds   | `.env` / config file | Yes             | Debugging; sites requiring a visible UI    |
+| Headed + manual entry   | User types into page | Yes             | Secrets that must not be stored on disk    |
+| Headless + no creds     | Cached session       | No              | Every run after the first, while cached    |
 
 ## Parallel headless browsers
+
+For sites without a usable API, the bridge can produce a pool of
+pre-authenticated browser contexts:
 
 ```python
 await bridge.ensure_authenticated()
 
 async with bridge.context_pool(size=4) as pool:
     pages = [await ctx.new_page() for ctx in pool]
-    # All four pages start already authenticated.
     ...
 ```
 
-Useful for portals where every read is a full page render.
-
-## Docs
+## Documentation
 
 - [Architecture](docs/architecture.md) — components, flows, and diagrams
-- [Design notes](docs/design.md) — decisions, alternatives, constraints
+- [Design notes](docs/design.md) — decisions, alternatives, and constraints
 - [Examples](docs/examples.md) — minimal snippets for common flows
-- [Testing](TESTING.md) — how to run unit, integration, and live-site tests
+- [Testing](TESTING.md) — unit, integration, and live-site tests
 - [Garmin example](examples/garmin_connect.py) — end-to-end Cloudflare-guarded
-  SSO + OAuth2 Bearer token flow
+  SSO plus OAuth2 Bearer token flow
 
 ## Development
 
@@ -128,14 +122,15 @@ git clone https://github.com/mikejhill/web-auth-bridge
 cd web-auth-bridge
 uv sync --all-extras
 uv run playwright install chromium
-uv run poe test     # unit + integration
-uv run poe cov      # with coverage report
-uv run poe lint     # ruff check
+uv run poe test
+uv run poe cov
+uv run poe lint
 ```
 
-Contributions welcome.  Please use [Conventional Commits](https://www.conventionalcommits.org/) —
-the release workflow derives versions from commit messages.
+Contributions are welcome. Please use
+[Conventional Commits](https://www.conventionalcommits.org/); the release
+workflow derives versions from commit messages.
 
 ## License
 
-MIT © Mike Hill
+MIT

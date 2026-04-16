@@ -8,13 +8,15 @@ on:
 
 permissions:
   contents: read
+  checks: write
+  pull-requests: write
 
 jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -31,7 +33,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -40,10 +42,25 @@ jobs:
       - name: Install Playwright browsers
         run: uv run playwright install --with-deps chromium
       - name: Run unit and integration tests with coverage
-        run: uv run pytest --cov=web_auth_bridge --cov-report=xml --cov-report=term
+        run: uv run pytest --cov=web_auth_bridge --cov-report=xml --cov-report=term --junitxml=junit.xml
+      - name: Publish test summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: junit.xml
+          show: "fail, skip"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-results-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            junit.xml
+            coverage.xml
+          if-no-files-found: ignore
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: coverage-xml
           path: coverage.xml
@@ -53,10 +70,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint, test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
       - run: uv build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: dist
           path: dist/

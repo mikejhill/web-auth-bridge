@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  checks: write
 
 jobs:
   e2e:
@@ -31,7 +32,7 @@ jobs:
       ROUVY_PASSWORD: ${{ secrets.ROUVY_PASSWORD }}
       WEB_AUTH_BRIDGE_E2E_HEADLESS: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -48,11 +49,26 @@ jobs:
           esac
 
       - name: Run e2e tests
-        run: uv run pytest -m "${{ steps.marker.outputs.expr }}" -v
+        run: uv run pytest -m "${{ steps.marker.outputs.expr }}" -v --junitxml=junit-e2e.xml
+
+      - name: Publish test summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: junit-e2e.xml
+          show: "fail, skip"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-results
+          path: junit-e2e.xml
+          if-no-files-found: ignore
 
       - name: Upload Playwright traces on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: playwright-traces
           path: |
