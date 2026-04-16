@@ -1,0 +1,61 @@
+name: E2E (live sites)
+
+# Live-site tests authenticate against real external services and require
+# credentials.  Never run on PRs or pushes — only on demand and on a
+# weekly schedule to catch upstream breakage early.
+
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: "Which site(s) to test"
+        type: choice
+        options: [all, garmin, rouvy]
+        default: all
+  schedule:
+    # Mondays at 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    environment: e2e
+    env:
+      GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+      GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+      ROUVY_EMAIL: ${{ secrets.ROUVY_EMAIL }}
+      ROUVY_PASSWORD: ${{ secrets.ROUVY_PASSWORD }}
+      WEB_AUTH_BRIDGE_E2E_HEADLESS: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - run: uv run playwright install --with-deps chromium
+
+      - name: Resolve marker expression
+        id: marker
+        run: |
+          case "${{ inputs.site || 'all' }}" in
+            garmin) echo "expr=e2e and garmin" >> "$GITHUB_OUTPUT" ;;
+            rouvy)  echo "expr=e2e and rouvy"  >> "$GITHUB_OUTPUT" ;;
+            *)      echo "expr=e2e"            >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Run e2e tests
+        run: uv run pytest -m "${{ steps.marker.outputs.expr }}" -v
+
+      - name: Upload Playwright traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: |
+            test-results/
+            playwright-report/
+          if-no-files-found: ignore

@@ -31,6 +31,9 @@ dev = [
     "pytest>=8.4",
     "pytest-asyncio>=1.0",
     "pytest-httpserver>=1.1",
+    "coverage>=7.13.5",
+    "pytest-cov>=7.1.0",
+    "poethepoet>=0.44.0",
 ]
 
 [build-system]
@@ -83,6 +86,42 @@ python-version = "3.12"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Marker-based test tiering:
+#   (no marker)    → unit tests. No browser, no network, no credentials.
+#   integration    → real Playwright browser against a local HTTP server.
+#                    No credentials, no external network. Slow but hermetic.
+#   e2e            → real external websites. Requires real credentials via
+#                    environment variables or a ``.env`` / ``.env.tests``
+#                    file at the project root. Skipped by default.
+#
+# Usage:
+#   pytest                       # unit only (fast, no deps)
+#   pytest -m "integration"      # integration only
+#   pytest -m "not e2e"          # everything except live sites
+#   pytest -m "e2e"              # live site tests (needs credentials)
+#   pytest -m "e2e and garmin"   # only Garmin e2e tests
 markers = [
-    "integration: requires real Playwright browser",
+    "integration: requires real Playwright browser (local HTTP server, no external network)",
+    "e2e: requires real external website credentials (loaded from environment or .env)",
+    "garmin: Garmin Connect e2e test (needs GARMIN_EMAIL/GARMIN_PASSWORD)",
+    "rouvy: Rouvy e2e test (needs ROUVY_EMAIL/ROUVY_PASSWORD)",
 ]
+# Exclude e2e tests from default collection — they require credentials and
+# network access, which unit/integration runs must not depend on.
+addopts = "-m 'not e2e'"
+
+
+[tool.poe.tasks]
+# Run with: uv run poe <task>   (or just: poe <task> inside the venv)
+test         = { cmd = "pytest",                                 help = "Unit + integration tests (default, no creds)" }
+test-unit    = { cmd = "pytest -m 'not integration and not e2e'", help = "Unit tests only - fastest" }
+test-int     = { cmd = "pytest -m integration",                   help = "Integration tests (Playwright + local server)" }
+test-e2e     = { cmd = "pytest -m e2e",                           help = "All live-site e2e tests (needs .env credentials)" }
+test-garmin  = { cmd = "pytest -m 'e2e and garmin'",              help = "Garmin live e2e only" }
+test-rouvy   = { cmd = "pytest -m 'e2e and rouvy'",               help = "Rouvy live e2e only" }
+cov          = { cmd = "pytest --cov=web_auth_bridge --cov-report=term-missing", help = "Default tests with coverage report" }
+cov-html     = { cmd = "pytest --cov=web_auth_bridge --cov-report=html",         help = "Coverage report as HTML in htmlcov/" }
+lint         = { cmd = "ruff check .",                            help = "Lint all sources and tests" }
+lint-fix     = { cmd = "ruff check . --fix",                      help = "Lint with autofix" }
+format       = { cmd = "ruff format .",                           help = "Format all sources and tests" }
+check        = { sequence = ["lint", "test"],                     help = "Lint + default tests (CI gate)" }
