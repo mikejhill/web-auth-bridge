@@ -34,7 +34,7 @@ jobs:
       WEB_AUTH_BRIDGE_E2E_HEADLESS: "true"
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
       - run: uv sync --all-extras

@@ -39,7 +39,7 @@ jobs:
       - name: Create local tag
         run: git tag "v${{ steps.semrel.outputs.version }}"
 
-      - uses: astral-sh/setup-uv@v8
+      - uses: astral-sh/setup-uv@v8.1.0
         with:
           enable-cache: true
       - run: uv sync --all-extras
