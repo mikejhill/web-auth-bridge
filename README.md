@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/mikejhill/web-auth-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/mikejhill/web-auth-bridge/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/web-auth-bridge.svg)](https://pypi.org/project/web-auth-bridge/)
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/pypi/pyversions/web-auth-bridge.svg)](https://pypi.org/project/web-auth-bridge/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Python library for authenticating against HTTP APIs whose login flows
@@ -83,6 +83,30 @@ cached session is reused until it expires.
   flow would cost more than the tool itself.
 
 If a site already offers a clean API token, use `httpx` directly.
+
+## Alternatives
+
+A managed browser is not always the right tool. Lighter-weight approaches
+exist and, when they work, cost a fraction of the memory and startup time:
+
+- **[`cloudscraper`](https://github.com/VeNoMouS/cloudscraper)**,
+  **[`curl_cffi`](https://github.com/lexiforest/curl_cffi)**, and
+  **[`tls-client`](https://github.com/bogdanfinn/tls-client)** impersonate
+  real browser TLS and HTTP/2 fingerprints to defeat fingerprint-based WAFs
+  without running a browser.
+- **[`hrequests`](https://github.com/daijro/hrequests)** and
+  **[`botasaurus`](https://github.com/omkarcloud/botasaurus)** wrap similar
+  techniques with higher-level scraping APIs.
+- Hand-crafted HTTP flows against documented OAuth, OIDC, or token endpoints
+  remain the best option whenever a site exposes them.
+
+`web-auth-bridge` exists for the cases those approaches do not cover:
+interactive SSO, MFA, SAML, stateful web portals, JavaScript-rendered
+challenges, and WAF rulesets that evolve faster than any fingerprint library
+can track. The tradeoff is resource cost for resilience — running an actual
+browser is heavier than a spoofed request, but it behaves like a browser
+because it is one, and it continues to work when the underlying site
+changes.
 
 ## Modes
 

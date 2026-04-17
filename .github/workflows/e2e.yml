@@ -1,10 +1,12 @@
 name: E2E (live sites)
 
 # Live-site tests authenticate against real external services and require
-# credentials.  Never run on PRs or pushes — only on demand and on a
-# weekly schedule to catch upstream breakage early.
+# credentials.  Run on main-branch pushes, manual dispatch, and on a weekly
+# schedule to catch upstream auth/flow breakage early.
 
 on:
+  push:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       site:
@@ -13,15 +15,11 @@ on:
         options: [all, garmin, rouvy]
         default: all
   schedule:
-    # Mondays at 06:00 UTC
     - cron: "0 6 * * 1"
 
 permissions:
   contents: read
   checks: write
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   e2e:
@@ -35,8 +33,8 @@ jobs:
       ROUVY_PASSWORD: ${{ secrets.ROUVY_PASSWORD }}
       WEB_AUTH_BRIDGE_E2E_HEADLESS: "true"
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
       - run: uv sync --all-extras
@@ -54,16 +52,19 @@ jobs:
       - name: Run e2e tests
         run: uv run pytest -m "${{ steps.marker.outputs.expr }}" -v --junitxml=junit-e2e.xml
 
-      - name: Publish test summary
+      - name: Publish test report
         if: always()
-        uses: test-summary/action@v2
+        uses: mikepenz/action-junit-report@v6
         with:
-          paths: junit-e2e.xml
-          show: "fail, skip"
+          report_paths: junit-e2e.xml
+          check_name: E2E tests
+          include_passed: true
+          detailed_summary: true
+          require_tests: true
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: junit-e2e.xml
@@ -71,7 +72,7 @@ jobs:
 
       - name: Upload Playwright traces on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-traces
           path: |

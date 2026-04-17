@@ -43,6 +43,36 @@ slashing the cost of parallel scraping.
 
 ## Alternatives considered
 
+### Why a managed browser at all?
+
+Several Python libraries attack the same problem space without running a
+browser, and they are excellent choices when they work:
+
+- **TLS / HTTP fingerprint spoofing.**
+  [`cloudscraper`](https://github.com/VeNoMouS/cloudscraper),
+  [`curl_cffi`](https://github.com/lexiforest/curl_cffi), and
+  [`tls-client`](https://github.com/bogdanfinn/tls-client) imitate real
+  browser TLS / HTTP&nbsp;2 fingerprints well enough to pass the
+  fingerprint-based checks some WAFs apply. Memory footprint is small and
+  startup is instant.
+- **Scraping wrappers.**
+  [`hrequests`](https://github.com/daijro/hrequests) and
+  [`botasaurus`](https://github.com/omkarcloud/botasaurus) bundle
+  fingerprint spoofing with higher-level scraping APIs.
+- **Hand-coded HTTP against documented endpoints.**
+  When a site exposes OAuth, OIDC, or a public token endpoint, a direct
+  HTTP flow is the cheapest and most reliable option.
+
+These approaches break when the site requires JavaScript execution,
+renders the login form dynamically, issues interactive WAF challenges
+(Cloudflare Turnstile, hCaptcha), uses SAML redirect chains, relies on
+browser storage APIs, or simply changes its detection rules — which
+happens often and without notice.
+
+`web-auth-bridge` deliberately picks the heavier tool to trade startup
+cost for resilience. A real browser behaves like a real browser because
+it is one; when the site changes, the browser keeps passing.
+
 ### Why Playwright, not Selenium?
 
 | Dimension | Playwright | Selenium |
