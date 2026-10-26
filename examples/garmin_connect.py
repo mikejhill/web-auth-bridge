@@ -182,7 +182,7 @@ async def _js_fetch_json(page: Page, url: str, payload: dict[str, Any]) -> dict[
     status: int = result["status"]
     body_text: str = result["body"]
 
-    log.debug("fetch(%s) → %d: %s", url, status, body_text[:200])
+    log.debug("Authentication fetch returned HTTP %d", status)
 
     if status == 429:
         # Retry once after a backoff for rate limiting
@@ -191,18 +191,18 @@ async def _js_fetch_json(page: Page, url: str, payload: dict[str, Any]) -> dict[
         result = await page.evaluate(script)
         status = result["status"]
         body_text = result["body"]
-        log.debug("retry fetch(%s) → %d: %s", url, status, body_text[:200])
+        log.debug("Authentication retry returned HTTP %d", status)
         if status == 429:
-            msg = f"Rate limited (429) after retry. Response: {body_text[:300]}"
+            msg = "Rate limited (429) after retry"
             raise RuntimeError(msg)
     if status == 403:
-        msg = f"Forbidden (403). Response: {body_text[:300]}"
+        msg = "Forbidden (403)"
         raise RuntimeError(msg)
 
     try:
         return json.loads(body_text)
     except json.JSONDecodeError as exc:
-        msg = f"Non-JSON response (HTTP {status}): {body_text[:300]}"
+        msg = f"Non-JSON authentication response (HTTP {status})"
         raise RuntimeError(msg) from exc
 
 
@@ -487,14 +487,14 @@ def _exchange_di_tokens(ticket: str) -> dict[str, str]:
         try:
             status, body = _post(DI_TOKEN_URL, headers, data)
         except Exception as exc:
-            log.debug("DI exchange transport error for %s: %s", client_id, exc)
+            log.debug("DI exchange transport error for %s: %s", client_id, type(exc).__name__)
             continue
 
         if status == 200:
             try:
                 token_data = json.loads(body)
             except json.JSONDecodeError:
-                log.debug("DI exchange 200 but non-JSON for %s: %s", client_id, body[:200])
+                log.debug("DI exchange 200 but non-JSON for %s", client_id)
                 continue
             log.info("DI Bearer token obtained (client_id=%s)", client_id)
             result = {"di_token": token_data["access_token"]}
@@ -504,7 +504,7 @@ def _exchange_di_tokens(ticket: str) -> dict[str, str]:
                 result["di_expires_in"] = str(token_data["expires_in"])
             return result
 
-        log.debug("DI exchange failed for %s: HTTP %d — %s", client_id, status, body[:200])
+        log.debug("DI exchange failed for %s: HTTP %d", client_id, status)
 
     log.warning("DI token exchange failed for all known client IDs — API calls will not work")
     return {}
@@ -552,9 +552,9 @@ def _verify_profile(di_token: str | None) -> dict[str, str]:
             if user_data.get("userName"):
                 tokens["username"] = user_data["userName"]
         except (json.JSONDecodeError, KeyError):
-            log.warning("user-settings 200 but payload unexpected: %s", body[:200])
+            log.warning("user-settings 200 but payload unexpected")
     else:
-        log.warning("user-settings returned HTTP %d: %s", status, body[:200])
+        log.warning("user-settings returned HTTP %d", status)
 
     log.info("Fetching social profile from connectapi.garmin.com ...")
     status, body = _get(SOCIAL_PROFILE_URL)
@@ -570,9 +570,9 @@ def _verify_profile(di_token: str | None) -> dict[str, str]:
                 tokens["full_name"] = full
             tokens["profile_verified"] = "true"
         except json.JSONDecodeError:
-            log.warning("socialProfile 200 but non-JSON: %s", body[:200])
+            log.warning("socialProfile 200 but non-JSON")
     else:
-        log.warning("socialProfile returned HTTP %d: %s", status, body[:200])
+        log.warning("socialProfile returned HTTP %d", status)
 
     return tokens
 
@@ -609,12 +609,12 @@ def _demo_api_calls(tokens: dict[str, str]) -> None:
     log.info("-" * 60)
     status, body = _get(RECENT_ACTIVITIES_URL)
     if status != 200:
-        log.warning("Recent activities returned HTTP %d: %s", status, body[:300])
+        log.warning("Recent activities returned HTTP %d", status)
         return
     try:
         activities = json.loads(body)
     except json.JSONDecodeError:
-        log.warning("Recent activities returned non-JSON: %s", body[:200])
+        log.warning("Recent activities returned non-JSON")
         return
     if not isinstance(activities, list) or not activities:
         log.info("No recent activities found.")

@@ -47,6 +47,12 @@ class RouvyAuthCallback:
     dismiss it defensively before submission.
     """
 
+    @staticmethod
+    def is_rouvy_domain(domain: str) -> bool:
+        """Match the Rouvy host or a subdomain at a DNS label boundary."""
+        host = domain.removeprefix(".").lower()
+        return host == "rouvy.com" or host.endswith(".rouvy.com")
+
     async def authenticate(self, page: Page, credentials: Credentials | None) -> AuthResult:
         if credentials is None:
             msg = "Rouvy AuthCallback requires credentials (manual mode not implemented)"
@@ -94,7 +100,9 @@ class RouvyAuthCallback:
         return AuthResult(cookies=cookies)
 
     async def is_authenticated(self, auth_result: AuthResult) -> bool:
-        return not auth_result.is_expired and any(c.domain.endswith("rouvy.com") for c in auth_result.cookies)
+        return not auth_result.is_expired and any(
+            RouvyAuthCallback.is_rouvy_domain(c.domain) for c in auth_result.cookies
+        )
 
 
 @pytest.fixture
@@ -123,7 +131,7 @@ class TestRouvyLiveAuth:
         result = await bridge.ensure_authenticated()
 
         assert isinstance(result, AuthResult), f"Expected AuthResult, got {type(result).__name__}"
-        rouvy_cookies = [c for c in result.cookies if c.domain.endswith("rouvy.com")]
+        rouvy_cookies = [c for c in result.cookies if RouvyAuthCallback.is_rouvy_domain(c.domain)]
         assert rouvy_cookies, (
             f"Expected at least one cookie on a .rouvy.com domain after login; "
             f"got cookies from domains: {sorted({c.domain for c in result.cookies})}"
@@ -184,8 +192,10 @@ class TestRouvyLiveAuth:
         )
         second_result = await second.ensure_authenticated()
 
-        first_cookies = {(c.name, c.value) for c in first_result.cookies if c.domain.endswith("rouvy.com")}
-        second_cookies = {(c.name, c.value) for c in second_result.cookies if c.domain.endswith("rouvy.com")}
+        first_cookies = {(c.name, c.value) for c in first_result.cookies if RouvyAuthCallback.is_rouvy_domain(c.domain)}
+        second_cookies = {
+            (c.name, c.value) for c in second_result.cookies if RouvyAuthCallback.is_rouvy_domain(c.domain)
+        }
         assert first_cookies == second_cookies, (
             "Second bridge should have reused cached cookies verbatim, "
             f"but they differ: {first_cookies.symmetric_difference(second_cookies)}"
