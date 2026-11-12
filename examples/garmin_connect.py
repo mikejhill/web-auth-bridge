@@ -271,7 +271,8 @@ class GarminAuthCallback:
         if resp_type == "MFA_REQUIRED":
             mfa_info = login_result.get("customerMfaInfo", {})
             mfa_method = mfa_info.get("mfaLastMethodUsed", "email")
-            log.info("MFA required (method: %s). Check your email for the code.", mfa_method)
+            # Do not log values from the credential-bearing login response.
+            log.info("MFA required. Check your email or authenticator app for the code.")
 
             mfa_code = input("Enter MFA code: ").strip()
             mfa_payload = {
@@ -422,7 +423,8 @@ class GarminAuthCallback:
             if csrf:
                 result_tokens["csrf_token"] = csrf
         except Exception:
-            pass
+            # The CSRF meta tag is optional; cookies alone are a usable result.
+            log.debug("No CSRF token found on the page", exc_info=True)
 
         log.info("Extracted %d cookies, %d tokens", len(cookies), len(result_tokens))
         return AuthResult(cookies=cookies, tokens=result_tokens)

@@ -58,7 +58,6 @@ class AuthCallback(Protocol):
         Raises:
             AuthError: If authentication fails for any reason.
         """
-        ...
 
     async def is_authenticated(self, auth_result: AuthResult) -> bool:
         """Check whether a cached ``AuthResult`` is still valid.
@@ -73,7 +72,6 @@ class AuthCallback(Protocol):
         Returns:
             ``True`` if the cached auth is still usable.
         """
-        ...
 
 
 @runtime_checkable
@@ -111,4 +109,3 @@ class SessionRenewalCallback(Protocol):
         Raises:
             SessionRenewalError: If session renewal fails.
         """
-        ...

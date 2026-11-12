@@ -20,11 +20,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_VIEWPORT = {"width": 1920, "height": 1080}
 _DEFAULT_LOCALE = "en-US"
 
-# Fallback UA when auto-detection is not possible (kept reasonably current).
-_FALLBACK_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-)
-
 
 def _detect_chromium_version() -> str | None:
     """Try to read the Chrome version from Playwright's bundled browser.
